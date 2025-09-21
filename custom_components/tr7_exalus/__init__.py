@@ -90,6 +90,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self.devices = {}
         self._listen_task = None
         self._auth_event = None
+        self._empty_device_states = 0  # Count consecutive empty device lists
+        self._last_auth_time: datetime | None = None
 
         super().__init__(
             hass,
@@ -105,6 +107,15 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except AttributeError:
             # Handle different websocket library versions
             return self.websocket is not None
+
+    async def _ensure_connected_and_authenticated(self) -> None:
+        """Ensure the websocket is connected and authenticated before sending commands."""
+        if not self._is_websocket_connected():
+            _LOGGER.info("WebSocket not connected. Reconnecting before command...")
+            await self._connect()
+        if not self.authenticated:
+            _LOGGER.info("Not authenticated. Authenticating before command...")
+            await self._authenticate()
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Update data via WebSocket."""
@@ -206,6 +217,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("Authentication failed - invalid credentials or system error")
 
             _LOGGER.info("Successfully authenticated with TR7 Exalus")
+            self._last_auth_time = datetime.now()
 
             # Perform initial device discovery after successful authentication
             await self._discover_devices()
@@ -263,9 +275,18 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except ConnectionClosed:
             _LOGGER.warning("WebSocket connection closed")
             self.authenticated = False
+            # Speed up recovery by triggering a refresh
+            try:
+                await self.async_request_refresh()
+            except Exception:
+                pass
         except Exception as err:
             _LOGGER.error("Error in message listener: %s", err)
             self.authenticated = False
+            try:
+                await self.async_request_refresh()
+            except Exception:
+                pass
 
     async def _handle_message(self, message: str) -> None:
         """Handle incoming WebSocket message."""
@@ -328,10 +349,23 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 return
 
             if not device_list:
-                _LOGGER.warning("Device states response contains no devices")
+                self._empty_device_states += 1
+                _LOGGER.warning("Device states response contains no devices (consecutive=%d)", self._empty_device_states)
+                # If we get repeated empty lists, likely auth/session expired – force re-auth
+                if self._empty_device_states >= 3:
+                    _LOGGER.warning("No devices returned %d times. Forcing re-authentication and re-discovery.", self._empty_device_states)
+                    self.authenticated = False
+                    # Trigger a refresh cycle to reconnect/authenticate
+                    try:
+                        await self.async_request_refresh()
+                    except Exception:
+                        pass
                 return
 
             _LOGGER.info("Processing %d devices from device states response", len(device_list))
+
+            # Reset empty response counter on success
+            self._empty_device_states = 0
 
             # Clear existing devices and repopulate
             self.devices.clear()
@@ -386,6 +420,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 "reliability": state.get("StateReliability", 0)
             }
 
+            # Reset empty list counter when a state change arrives
+            self._empty_device_states = 0
+
             # Notify listeners
             self.async_set_updated_data(self.devices)
 
@@ -412,6 +449,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
     async def _send_position_command(self, device_guid: str, position: int, channel: int) -> None:
         """Send position command using the correct TR7 API format."""
+        # Ensure connection/auth before sending
+        await self._ensure_connected_and_authenticated()
         try:
             transaction_id = str(uuid.uuid4())
 
@@ -449,6 +488,13 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Give some time for the command to be processed
             await asyncio.sleep(0.5)
 
+        except UpdateFailed as err:
+            _LOGGER.warning("Position command failed, attempting re-auth and retry: %s", err)
+            # Force re-auth and retry once
+            self.authenticated = False
+            await self._ensure_connected_and_authenticated()
+            await self._send_message(message)
+            await asyncio.sleep(0.5)
         except Exception as err:
             _LOGGER.error("Failed to send position command: %s", err)
             raise
@@ -463,6 +509,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
     async def stop_cover(self, device_guid: str) -> None:
         """Stop cover movement."""
+        # Ensure connection/auth before sending
+        await self._ensure_connected_and_authenticated()
         try:
             transaction_id = str(uuid.uuid4())
             device_info = self.devices.get(device_guid, {})
@@ -487,6 +535,11 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Stop command: %s", message)
             await self._send_message(message)
 
+        except UpdateFailed as err:
+            _LOGGER.warning("Stop command failed, attempting re-auth and retry: %s", err)
+            self.authenticated = False
+            await self._ensure_connected_and_authenticated()
+            await self._send_message(message)
         except Exception as err:
             _LOGGER.error("Error stopping cover for device %s: %s", device_guid, err)
             raise

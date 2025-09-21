@@ -14,9 +14,14 @@ A custom Home Assistant integration for controlling TR7 Exalus smart blinds via 
 
 ### HACS (Recommended)
 
-1. Add this repository to HACS as a custom repository
-2. Install "TR7 Exalus" through HACS
-3. Restart Home Assistant
+1. In Home Assistant, go to HACS → Integrations → ⋮ (overflow menu) → Custom repositories.
+2. Paste the URL of this repository (for example, https://github.com/krystaDev/home-assistant-tr7-exalus) and select Category: Integration, then click Add.
+3. In HACS → Integrations, search for "TR7 Exalus Blind Control" and click Install.
+4. Restart Home Assistant.
+
+Notes:
+- Requires Home Assistant 2024.8.0 or newer (set in hacs.json).
+- After installation, configure the integration from Settings → Devices & Services → Add Integration → "TR7 Exalus".
 
 ### Manual Installation
 
