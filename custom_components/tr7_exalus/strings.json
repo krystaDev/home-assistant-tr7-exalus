@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up TR7 Exalus",
+        "description": "Enter your TR7 Exalus system details",
+        "data": {
+          "host": "Host IP Address",
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to TR7 Exalus system",
+      "invalid_auth": "Invalid authentication credentials",
+      "unknown": "Unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "TR7 Exalus system is already configured"
+    }
+  }
+}
