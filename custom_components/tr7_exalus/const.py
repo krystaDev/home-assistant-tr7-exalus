@@ -27,7 +27,6 @@ RESOURCE_DEVICE_STATE_CHANGED = "/info/devices/device/state/changed"
 RESOURCE_DEVICE_CONTROL = "/devices/device/control"
 RESOURCE_DEVICE_POSITION = "/devices/device/position"
 RESOURCE_DEVICE_STOP = "/devices/device/stop"
-RESOURCE_SYSTEM_PING = "/system/ping"
 
 # Data types
 DATA_TYPE_BLIND_POSITION = "BlindPosition"
