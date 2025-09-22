@@ -94,6 +94,10 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._empty_device_states = 0  # Count consecutive empty device lists
         self._last_auth_time: datetime | None = None
         self._last_activity: datetime | None = None
+        self._command_lock = asyncio.Lock()
+        self._last_command_time: datetime | None = None
+        self._command_delay = 0.5  # 500ms base delay between commands
+        self._timeout_count = 0
 
         super().__init__(
             hass,
@@ -198,6 +202,11 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Initialize activity tracking
             self._last_activity = datetime.now()
 
+            # Reset rate limiting variables
+            self._last_command_time = None
+            self._command_delay = 0.5
+            self._timeout_count = 0
+
             # Cancel any existing tasks
             if self._listen_task:
                 self._listen_task.cancel()
@@ -279,23 +288,41 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Don't raise - authentication was successful, just device discovery failed
 
     async def _send_message(self, message: dict) -> None:
-        """Send a message via WebSocket."""
+        """Send a message via WebSocket with rate limiting."""
         if not self._is_websocket_connected():
             raise UpdateFailed("WebSocket not connected")
 
-        try:
-            message_str = json.dumps(message)
-            _LOGGER.info("Sending WebSocket message: %s", message_str)
-            await self.websocket.send(message_str)
-            _LOGGER.debug("Message sent successfully")
+        # Use lock to ensure commands are sent sequentially
+        async with self._command_lock:
+            # Enforce minimum delay between commands
+            if self._last_command_time:
+                time_since_last = datetime.now() - self._last_command_time
+                min_delay = timedelta(seconds=self._command_delay)
+                if time_since_last < min_delay:
+                    sleep_time = (min_delay - time_since_last).total_seconds()
+                    _LOGGER.debug("Rate limiting: waiting %.2fs before next command", sleep_time)
+                    await asyncio.sleep(sleep_time)
 
-            # Update activity timestamp
-            self._last_activity = datetime.now()
-        except (ConnectionClosed, WebSocketException) as err:
-            _LOGGER.error("Error sending message: %s", err)
-            self.authenticated = False
-            self._last_auth_time = None
-            raise UpdateFailed(f"Failed to send message: {err}") from err
+            try:
+                message_str = json.dumps(message)
+                _LOGGER.info("Sending WebSocket message: %s", message_str)
+                await self.websocket.send(message_str)
+                _LOGGER.debug("Message sent successfully")
+
+                # Update timestamps
+                self._last_command_time = datetime.now()
+                self._last_activity = datetime.now()
+
+                # Reset timeout count on successful send
+                self._timeout_count = 0
+                # Reset command delay to base value on success
+                self._command_delay = 0.5
+
+            except (ConnectionClosed, WebSocketException) as err:
+                _LOGGER.error("Error sending message: %s", err)
+                self.authenticated = False
+                self._last_auth_time = None
+                raise UpdateFailed(f"Failed to send message: {err}") from err
 
     async def _listen_for_messages(self) -> None:
         """Listen for incoming WebSocket messages."""
@@ -342,6 +369,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                     _LOGGER.info("Authentication successful for user: %s %s (%s)",
                                 user_data.get("Name"), user_data.get("Surname"), user_data.get("Email"))
                     self.authenticated = True
+                    # Reset timeout count on successful authentication
+                    self._timeout_count = 0
                 else:
                     _LOGGER.error("Authentication failed with status: %s", status)
                     self.authenticated = False
@@ -366,10 +395,18 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 if transaction_id:
                     _LOGGER.warning("🎯 API DISCOVERY RESPONSE: Resource=%s, Status=%s, TransactionId=%s, Data=%s",
                                   resource, status, transaction_id, data.get("Data"))
+
+                    # Reset timeout count on successful device control commands
+                    if resource in {RESOURCE_DEVICE_CONTROL, RESOURCE_DEVICE_POSITION, RESOURCE_DEVICE_STOP} and status == 0:
+                        if self._timeout_count > 0:
+                            _LOGGER.debug("Successful command response, resetting timeout count from %d", self._timeout_count)
+                            self._timeout_count = 0
+                            # Gradually reduce command delay on success
+                            self._command_delay = max(self._command_delay * 0.9, 0.5)
                 else:
                     _LOGGER.debug("Received other message type - Resource: %s, Status: %s", resource, status)
 
-                # If we get a non-zero status on critical endpoints, log but don't immediately re-authenticate
+                # Handle non-zero status responses with rate limiting awareness
                 try:
                     critical_resources = {
                         RESOURCE_DEVICE_CONTROL,
@@ -378,10 +415,24 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                         RESOURCE_DEVICE_STATES,
                     }
                     if resource in critical_resources and status not in (None, 0):
-                        _LOGGER.warning("Non-zero status (%s) for resource %s. Response: %s", status, resource, data.get("Data"))
-                        # Only force re-auth for serious errors, not timeouts
-                        if status != 10:  # 10 = DeviceResponseTimeout, which may be temporary
-                            _LOGGER.warning("Critical error (Status=%s) for resource %s. Marking unauthenticated.", status, resource)
+                        if status == 10:  # DeviceResponseTimeout
+                            self._timeout_count += 1
+                            # Implement exponential backoff for timeouts
+                            old_delay = self._command_delay
+                            self._command_delay = min(self._command_delay * 1.5, 3.0)  # Cap at 3 seconds
+                            _LOGGER.warning("Device timeout #%d (Status=%s) for resource %s. Increasing command delay from %.2fs to %.2fs",
+                                          self._timeout_count, status, resource, old_delay, self._command_delay)
+
+                            # Only force re-auth after many consecutive timeouts
+                            if self._timeout_count >= 10:
+                                _LOGGER.error("Too many consecutive timeouts (%d), forcing re-authentication", self._timeout_count)
+                                self.authenticated = False
+                                self._last_auth_time = None
+                                self._timeout_count = 0
+                                self._command_delay = 0.5  # Reset delay
+                        else:
+                            # Other non-zero statuses are more serious
+                            _LOGGER.warning("Critical error (Status=%s) for resource %s. Response: %s", status, resource, data.get("Data"))
                             self.authenticated = False
                             self._last_auth_time = None
                 except Exception:
@@ -428,6 +479,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             # Reset empty response counter on success
             self._empty_device_states = 0
+            # Reset timeout count on successful device discovery
+            self._timeout_count = 0
 
             # Clear existing devices and repopulate
             self.devices.clear()
@@ -629,4 +682,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self.authenticated = False
         self._last_auth_time = None
         self._last_activity = None
+        self._last_command_time = None
+        self._command_delay = 0.5
+        self._timeout_count = 0
         _LOGGER.info("TR7 Exalus connection closed")
