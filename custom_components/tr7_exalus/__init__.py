@@ -113,6 +113,13 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         if not self._is_websocket_connected():
             _LOGGER.info("WebSocket not connected. Reconnecting before command...")
             await self._connect()
+        # Proactively re-authenticate if the auth is stale (some TR7 hubs drop auth ~30min)
+        if self.authenticated and self._last_auth_time:
+            age = datetime.now() - self._last_auth_time
+            if age > timedelta(minutes=25):
+                _LOGGER.info("Authentication is stale (age=%s). Re-authenticating before command...", age)
+                self.authenticated = False
+                self._last_auth_time = None
         if not self.authenticated:
             _LOGGER.info("Not authenticated. Authenticating before command...")
             await self._authenticate()
@@ -128,6 +135,14 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         if not ws_connected:
             _LOGGER.info("WebSocket not connected, attempting to reconnect...")
             await self._connect()
+
+        # Proactively re-authenticate if auth is stale even if connection looks fine
+        if self.authenticated and self._last_auth_time:
+            age = datetime.now() - self._last_auth_time
+            if age > timedelta(minutes=25):
+                _LOGGER.info("Authentication is stale (age=%s). Forcing re-authentication...", age)
+                self.authenticated = False
+                self._last_auth_time = None
 
         if not self.authenticated:
             _LOGGER.info("Not authenticated, attempting to authenticate...")
@@ -146,6 +161,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Failed to send periodic device states request: %s", err)
             # Connection might be broken, trigger reconnect on next update
             self.authenticated = False
+            self._last_auth_time = None
 
         # Log device availability for debugging
         if device_count == 0:
@@ -265,6 +281,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except (ConnectionClosed, WebSocketException) as err:
             _LOGGER.error("Error sending message: %s", err)
             self.authenticated = False
+            self._last_auth_time = None
             raise UpdateFailed(f"Failed to send message: {err}") from err
 
     async def _listen_for_messages(self) -> None:
@@ -275,6 +292,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except ConnectionClosed:
             _LOGGER.warning("WebSocket connection closed")
             self.authenticated = False
+            self._last_auth_time = None
             # Speed up recovery by triggering a refresh
             try:
                 await self.async_request_refresh()
@@ -283,6 +301,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Error in message listener: %s", err)
             self.authenticated = False
+            self._last_auth_time = None
             try:
                 await self.async_request_refresh()
             except Exception:
@@ -310,6 +329,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 else:
                     _LOGGER.error("Authentication failed with status: %s", status)
                     self.authenticated = False
+                    self._last_auth_time = None
 
                 # Signal authentication completion
                 if self._auth_event:
@@ -355,6 +375,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 if self._empty_device_states >= 3:
                     _LOGGER.warning("No devices returned %d times. Forcing re-authentication and re-discovery.", self._empty_device_states)
                     self.authenticated = False
+                    self._last_auth_time = None
                     # Trigger a refresh cycle to reconnect/authenticate
                     try:
                         await self.async_request_refresh()
@@ -492,6 +513,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Position command failed, attempting re-auth and retry: %s", err)
             # Force re-auth and retry once
             self.authenticated = False
+            self._last_auth_time = None
             await self._ensure_connected_and_authenticated()
             await self._send_message(message)
             await asyncio.sleep(0.5)
@@ -538,6 +560,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except UpdateFailed as err:
             _LOGGER.warning("Stop command failed, attempting re-auth and retry: %s", err)
             self.authenticated = False
+            self._last_auth_time = None
             await self._ensure_connected_and_authenticated()
             await self._send_message(message)
         except Exception as err:
@@ -561,4 +584,5 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
         self.websocket = None
         self.authenticated = False
+        self._last_auth_time = None
         _LOGGER.info("TR7 Exalus connection closed")
