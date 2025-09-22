@@ -242,7 +242,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             # Wait for authentication response with timeout
             try:
-                await asyncio.wait_for(self._auth_event.wait(), timeout=10.0)
+                await asyncio.wait_for(self._auth_event.wait(), timeout=20.0)
             except asyncio.TimeoutError:
                 raise UpdateFailed("Authentication timeout - no response from TR7 system")
 
@@ -356,6 +356,18 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                     _LOGGER.info("Authentication successful for user: %s %s (%s)",
                                 user_data.get("Name"), user_data.get("Surname"), user_data.get("Email"))
                     self.authenticated = True
+                    self._last_auth_time = datetime.now()
+
+                    # If we got a late response after timeout, we need to complete the setup
+                    if not self._auth_event or self._auth_event.is_set():
+                        _LOGGER.info("Late authentication response received, completing setup...")
+                        # Start device discovery and ping task if not already done
+                        try:
+                            await self._discover_devices()
+                            await asyncio.sleep(2)
+                            await self._start_ping_task()
+                        except Exception as err:
+                            _LOGGER.error("Error in late authentication setup: %s", err)
                 else:
                     _LOGGER.error("Authentication failed with status: %s", status)
                     self.authenticated = False
