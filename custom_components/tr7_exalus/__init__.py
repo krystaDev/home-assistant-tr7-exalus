@@ -97,6 +97,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._last_auth_time: datetime | None = None
         self._last_ping_response: datetime | None = None
         self._ping_failures = 0
+        self._timeout_count = 0
+        self._last_reconnect_attempt: datetime | None = None
 
         super().__init__(
             hass,
@@ -198,6 +200,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Reset ping tracking
             self._last_ping_response = None
             self._ping_failures = 0
+            self._timeout_count = 0
+            self._last_reconnect_attempt = None
 
             # Cancel any existing tasks
             if self._listen_task:
@@ -248,11 +252,15 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.info("Successfully authenticated with TR7 Exalus")
             self._last_auth_time = datetime.now()
 
-            # Start ping task to keep connection alive
-            await self._start_ping_task()
-
             # Perform initial device discovery after successful authentication
             await self._discover_devices()
+
+            # Wait a moment for system to stabilize before starting ping task
+            await asyncio.sleep(2)
+
+            # Start ping task to keep connection alive
+            _LOGGER.info("Starting ping task to maintain TR7 connection...")
+            await self._start_ping_task()
 
         except Exception as err:
             _LOGGER.error("Authentication error: %s", err)
@@ -369,7 +377,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             # Handle ping responses
             elif resource == RESOURCE_SYSTEM_PING:
-                _LOGGER.debug("Received ping response: Status=%s, TransactionId=%s", status, transaction_id)
+                _LOGGER.info("Received TR7 ping response: Status=%s, TransactionId=%s", status, transaction_id)
                 # Update ping response tracking
                 self._last_ping_response = datetime.now()
                 self._ping_failures = 0  # Reset failure counter on successful response
@@ -382,7 +390,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 else:
                     _LOGGER.debug("Received other message type - Resource: %s, Status: %s", resource, status)
 
-                # If we get a non-zero status on critical endpoints, assume auth issue and force re-auth
+                # Handle non-zero status responses more carefully
                 try:
                     critical_resources = {
                         RESOURCE_DEVICE_CONTROL,
@@ -391,13 +399,39 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                         RESOURCE_DEVICE_STATES,
                     }
                     if resource in critical_resources and status not in (None, 0):
-                        _LOGGER.warning("Non-zero status (%s) for resource %s. Marking unauthenticated and scheduling re-auth.", status, resource)
-                        self.authenticated = False
-                        self._last_auth_time = None
-                        try:
-                            await self.async_request_refresh()
-                        except Exception:
-                            pass
+                        # Status 10 is DeviceResponseTimeout - handle more gracefully
+                        if status == 10:
+                            _LOGGER.warning("Device timeout (Status=%s) for resource %s. This may be temporary.", status, resource)
+                            # Don't immediately force re-auth for timeouts, they may be temporary
+                            # Only increment timeout counter and re-auth after multiple timeouts
+                            timeout_count = getattr(self, '_timeout_count', 0) + 1
+                            self._timeout_count = timeout_count
+                            if timeout_count >= 3:
+                                # Check if we recently attempted reconnection to avoid loops
+                                if self._last_reconnect_attempt:
+                                    time_since_last = datetime.now() - self._last_reconnect_attempt
+                                    if time_since_last < timedelta(seconds=30):
+                                        _LOGGER.info("Skipping reconnection - too recent (last attempt %s ago)", time_since_last)
+                                        return
+
+                                _LOGGER.warning("Multiple device timeouts (%d), forcing re-authentication", timeout_count)
+                                self.authenticated = False
+                                self._last_auth_time = None
+                                self._timeout_count = 0
+                                self._last_reconnect_attempt = datetime.now()
+                                try:
+                                    await self.async_request_refresh()
+                                except Exception:
+                                    pass
+                        else:
+                            # Other non-zero statuses are more serious
+                            _LOGGER.warning("Non-zero status (%s) for resource %s. Marking unauthenticated and scheduling re-auth.", status, resource)
+                            self.authenticated = False
+                            self._last_auth_time = None
+                            try:
+                                await self.async_request_refresh()
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -442,6 +476,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             # Reset empty response counter on success
             self._empty_device_states = 0
+            # Reset timeout counter when we get successful device states
+            self._timeout_count = 0
 
             # Clear existing devices and repopulate
             self.devices.clear()
@@ -516,16 +552,17 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
     async def _ping_worker(self) -> None:
         """Send periodic ping messages to keep connection alive."""
+        _LOGGER.info("TR7 ping worker started")
         try:
             while self._is_websocket_connected():
                 try:
                     # Check if we haven't received a ping response in too long
                     if self._last_ping_response:
                         age = datetime.now() - self._last_ping_response
-                        if age > timedelta(seconds=30):  # No response for 30 seconds
+                        if age > timedelta(seconds=60):  # No response for 60 seconds (more lenient)
                             _LOGGER.warning("No ping response for %s, connection may be stale", age)
                             self._ping_failures += 1
-                            if self._ping_failures >= 3:
+                            if self._ping_failures >= 5:  # More attempts before giving up
                                 _LOGGER.error("Too many ping failures (%d), triggering reconnection", self._ping_failures)
                                 # Force reconnection by breaking out and triggering refresh
                                 self.authenticated = False
@@ -544,16 +581,16 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                     }
 
                     await self._send_message(ping_message)
-                    _LOGGER.debug("Sent TR7 ping message")
+                    _LOGGER.info("Sent TR7 ping message (failures: %d)", self._ping_failures)
 
-                    # Wait 5 seconds before next ping
-                    await asyncio.sleep(5)
+                    # Wait 15 seconds before next ping (less aggressive)
+                    await asyncio.sleep(15)
 
                 except Exception as err:
                     _LOGGER.warning("Error sending ping: %s", err)
                     self._ping_failures += 1
-                    # On ping failure, try a few times before giving up
-                    if self._ping_failures >= 3:
+                    # On ping failure, try more times before giving up
+                    if self._ping_failures >= 5:
                         _LOGGER.error("Multiple ping failures (%d), triggering reconnection", self._ping_failures)
                         self.authenticated = False
                         self._last_auth_time = None
@@ -563,11 +600,12 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                             pass
                         break
                     else:
-                        # Wait a bit before retrying
-                        await asyncio.sleep(2)
+                        # Wait longer before retrying
+                        _LOGGER.info("Ping failed, waiting 10 seconds before retry (attempt %d/5)", self._ping_failures)
+                        await asyncio.sleep(10)
 
         except asyncio.CancelledError:
-            _LOGGER.debug("Ping task cancelled")
+            _LOGGER.info("TR7 ping task cancelled")
         except Exception as err:
             _LOGGER.error("Ping worker error: %s", err)
 
@@ -713,4 +751,6 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._last_auth_time = None
         self._last_ping_response = None
         self._ping_failures = 0
+        self._timeout_count = 0
+        self._last_reconnect_attempt = None
         _LOGGER.info("TR7 Exalus connection closed")
