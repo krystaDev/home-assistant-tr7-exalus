@@ -10,6 +10,7 @@ from homeassistant.components.cover import (
     CoverEntity,
     CoverEntityFeature,
 )
+from homeassistant.components.logbook import async_log_entry
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -69,6 +70,22 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
             | CoverEntityFeature.STOP
             | CoverEntityFeature.SET_POSITION
         )
+
+    def _log_action(self, message: str) -> None:
+        """Write an entry to Home Assistant Logbook (Diary)."""
+        try:
+            ctx = getattr(self, "context", None)
+            ctx_id = getattr(ctx, "id", None) if ctx is not None else None
+            async_log_entry(
+                self.hass,
+                name="TR7 Exalus",
+                message=message,
+                domain="cover",
+                entity_id=self.entity_id,
+                context_id=ctx_id,
+            )
+        except Exception as err:
+            _LOGGER.debug("Failed to write Logbook entry for %s: %s", self.entity_id, err)
 
     @property
     def device_info(self) -> dict[str, Any]:
@@ -153,6 +170,8 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
             _LOGGER.debug("Calling coordinator.open_cover for device %s", self._device_guid)
             await self.coordinator.open_cover(self._device_guid)
             _LOGGER.info("Successfully called open_cover for device %s", self._device_guid)
+            # Log to Home Assistant Logbook (Diary)
+            self._log_action("Opened")
             # Force update after command
             await self.coordinator.async_request_refresh()
         except Exception as err:
@@ -166,6 +185,8 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
             _LOGGER.debug("Calling coordinator.close_cover for device %s", self._device_guid)
             await self.coordinator.close_cover(self._device_guid)
             _LOGGER.info("Successfully called close_cover for device %s", self._device_guid)
+            # Log to Home Assistant Logbook (Diary)
+            self._log_action("Closed")
             # Force update after command
             await self.coordinator.async_request_refresh()
         except Exception as err:
@@ -179,6 +200,8 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
             _LOGGER.debug("Calling coordinator.stop_cover for device %s", self._device_guid)
             await self.coordinator.stop_cover(self._device_guid)
             _LOGGER.info("Successfully called stop_cover for device %s", self._device_guid)
+            # Log to Home Assistant Logbook (Diary)
+            self._log_action("Stopped")
             # Force update after command
             await self.coordinator.async_request_refresh()
         except Exception as err:
@@ -199,6 +222,8 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
             _LOGGER.debug("Setting cover position to %s for device %s", position, self._device_guid)
             await self.coordinator.set_cover_position(self._device_guid, position)
             _LOGGER.info("Successfully called set_cover_position for device %s", self._device_guid)
+            # Log to Home Assistant Logbook (Diary)
+            self._log_action(f"Set position to {position}%")
             # Force update after command
             await self.coordinator.async_request_refresh()
         except Exception as err:
