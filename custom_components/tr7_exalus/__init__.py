@@ -35,6 +35,7 @@ from .const import (
     RESOURCE_DEVICE_STATE_CHANGED,
     RESOURCE_DEVICE_STOP,
     RESOURCE_LOGIN,
+    RESOURCE_SYSTEM_PING,
     WS_API_PATH,
     AUTH_REFRESH_MINUTES,
 )
@@ -90,9 +91,12 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self.authenticated = False
         self.devices = {}
         self._listen_task = None
+        self._ping_task = None
         self._auth_event = None
         self._empty_device_states = 0  # Count consecutive empty device lists
         self._last_auth_time: datetime | None = None
+        self._last_ping_response: datetime | None = None
+        self._ping_failures = 0
 
         super().__init__(
             hass,
@@ -191,9 +195,17 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             self.authenticated = False
             self._auth_event = asyncio.Event()
 
-            # Start listening for messages BEFORE authentication
+            # Reset ping tracking
+            self._last_ping_response = None
+            self._ping_failures = 0
+
+            # Cancel any existing tasks
             if self._listen_task:
                 self._listen_task.cancel()
+            if self._ping_task:
+                self._ping_task.cancel()
+
+            # Start listening for messages BEFORE authentication
             self._listen_task = asyncio.create_task(self._listen_for_messages())
 
             # Give the listener a moment to start
@@ -235,6 +247,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             _LOGGER.info("Successfully authenticated with TR7 Exalus")
             self._last_auth_time = datetime.now()
+
+            # Start ping task to keep connection alive
+            await self._start_ping_task()
 
             # Perform initial device discovery after successful authentication
             await self._discover_devices()
@@ -294,6 +309,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("WebSocket connection closed")
             self.authenticated = False
             self._last_auth_time = None
+            # Cancel ping task since connection is lost
+            if self._ping_task:
+                self._ping_task.cancel()
             # Speed up recovery by triggering a refresh
             try:
                 await self.async_request_refresh()
@@ -303,6 +321,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error in message listener: %s", err)
             self.authenticated = False
             self._last_auth_time = None
+            # Cancel ping task since connection has issues
+            if self._ping_task:
+                self._ping_task.cancel()
             try:
                 await self.async_request_refresh()
             except Exception:
@@ -345,6 +366,13 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             elif resource == RESOURCE_DEVICE_STATE_CHANGED:
                 _LOGGER.debug("Received device state change: %s", data)
                 await self._handle_device_state_change(data)
+
+            # Handle ping responses
+            elif resource == RESOURCE_SYSTEM_PING:
+                _LOGGER.debug("Received ping response: Status=%s, TransactionId=%s", status, transaction_id)
+                # Update ping response tracking
+                self._last_ping_response = datetime.now()
+                self._ping_failures = 0  # Reset failure counter on successful response
 
             # Handle other messages - look for API responses
             else:
@@ -479,6 +507,70 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Error handling device state change: %s", err)
 
+    async def _start_ping_task(self) -> None:
+        """Start the periodic ping task."""
+        if self._ping_task:
+            self._ping_task.cancel()
+        self._ping_task = asyncio.create_task(self._ping_worker())
+        _LOGGER.debug("Started TR7 ping task")
+
+    async def _ping_worker(self) -> None:
+        """Send periodic ping messages to keep connection alive."""
+        try:
+            while self._is_websocket_connected():
+                try:
+                    # Check if we haven't received a ping response in too long
+                    if self._last_ping_response:
+                        age = datetime.now() - self._last_ping_response
+                        if age > timedelta(seconds=30):  # No response for 30 seconds
+                            _LOGGER.warning("No ping response for %s, connection may be stale", age)
+                            self._ping_failures += 1
+                            if self._ping_failures >= 3:
+                                _LOGGER.error("Too many ping failures (%d), triggering reconnection", self._ping_failures)
+                                # Force reconnection by breaking out and triggering refresh
+                                self.authenticated = False
+                                self._last_auth_time = None
+                                try:
+                                    await self.async_request_refresh()
+                                except Exception:
+                                    pass
+                                break
+
+                    # Send TR7-specific ping message
+                    ping_message = {
+                        "TransactionId": str(uuid.uuid4()),
+                        "Resource": RESOURCE_SYSTEM_PING,
+                        "Method": METHOD_GET
+                    }
+
+                    await self._send_message(ping_message)
+                    _LOGGER.debug("Sent TR7 ping message")
+
+                    # Wait 5 seconds before next ping
+                    await asyncio.sleep(5)
+
+                except Exception as err:
+                    _LOGGER.warning("Error sending ping: %s", err)
+                    self._ping_failures += 1
+                    # On ping failure, try a few times before giving up
+                    if self._ping_failures >= 3:
+                        _LOGGER.error("Multiple ping failures (%d), triggering reconnection", self._ping_failures)
+                        self.authenticated = False
+                        self._last_auth_time = None
+                        try:
+                            await self.async_request_refresh()
+                        except Exception:
+                            pass
+                        break
+                    else:
+                        # Wait a bit before retrying
+                        await asyncio.sleep(2)
+
+        except asyncio.CancelledError:
+            _LOGGER.debug("Ping task cancelled")
+        except Exception as err:
+            _LOGGER.error("Ping worker error: %s", err)
+
     async def set_cover_position(self, device_guid: str, position: int) -> None:
         """Set cover position."""
         try:
@@ -603,6 +695,13 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             except asyncio.CancelledError:
                 pass
 
+        if self._ping_task:
+            self._ping_task.cancel()
+            try:
+                await self._ping_task
+            except asyncio.CancelledError:
+                pass
+
         if self.websocket:
             try:
                 await self.websocket.close()
@@ -612,4 +711,6 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self.websocket = None
         self.authenticated = False
         self._last_auth_time = None
+        self._last_ping_response = None
+        self._ping_failures = 0
         _LOGGER.info("TR7 Exalus connection closed")
