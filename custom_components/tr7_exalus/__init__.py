@@ -36,6 +36,7 @@ from .const import (
     RESOURCE_DEVICE_STOP,
     RESOURCE_LOGIN,
     WS_API_PATH,
+    AUTH_REFRESH_MINUTES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -116,7 +117,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         # Proactively re-authenticate if the auth is stale (some TR7 hubs drop auth ~30min)
         if self.authenticated and self._last_auth_time:
             age = datetime.now() - self._last_auth_time
-            if age > timedelta(minutes=25):
+            if age > timedelta(minutes=AUTH_REFRESH_MINUTES):
                 _LOGGER.info("Authentication is stale (age=%s). Re-authenticating before command...", age)
                 self.authenticated = False
                 self._last_auth_time = None
@@ -139,7 +140,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         # Proactively re-authenticate if auth is stale even if connection looks fine
         if self.authenticated and self._last_auth_time:
             age = datetime.now() - self._last_auth_time
-            if age > timedelta(minutes=25):
+            if age > timedelta(minutes=AUTH_REFRESH_MINUTES):
                 _LOGGER.info("Authentication is stale (age=%s). Forcing re-authentication...", age)
                 self.authenticated = False
                 self._last_auth_time = None
@@ -353,6 +354,25 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 else:
                     _LOGGER.debug("Received other message type - Resource: %s, Status: %s", resource, status)
 
+                # If we get a non-zero status on critical endpoints, assume auth issue and force re-auth
+                try:
+                    critical_resources = {
+                        RESOURCE_DEVICE_CONTROL,
+                        RESOURCE_DEVICE_POSITION,
+                        RESOURCE_DEVICE_STOP,
+                        RESOURCE_DEVICE_STATES,
+                    }
+                    if resource in critical_resources and status not in (None, 0):
+                        _LOGGER.warning("Non-zero status (%s) for resource %s. Marking unauthenticated and scheduling re-auth.", status, resource)
+                        self.authenticated = False
+                        self._last_auth_time = None
+                        try:
+                            await self.async_request_refresh()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
         except json.JSONDecodeError as err:
             _LOGGER.error("Failed to decode WebSocket message: %s - Raw message: %s", err, message)
         except Exception as err:
@@ -365,7 +385,14 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             device_list = data.get("Data", [])
 
             if status != 0:
-                _LOGGER.warning("Device states request failed with status: %s", status)
+                _LOGGER.warning("Device states request failed with status: %s; forcing re-authentication", status)
+                # Treat non-zero status as likely auth/session issue
+                self.authenticated = False
+                self._last_auth_time = None
+                try:
+                    await self.async_request_refresh()
+                except Exception:
+                    pass
                 return
 
             if not device_list:

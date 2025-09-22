@@ -32,5 +32,10 @@ RESOURCE_DEVICE_STOP = "/devices/device/stop"
 DATA_TYPE_BLIND_POSITION = "BlindPosition"
 DATA_TYPE_SCENE_EXECUTED = "SceneExecuted"
 
+# Auth/session behavior
+# Some TR7 hubs appear to expire session auth within a few minutes.
+# We proactively refresh authentication before this window elapses.
+AUTH_REFRESH_MINUTES = 3
+
 # Entity platforms
 PLATFORMS = ["cover"]
