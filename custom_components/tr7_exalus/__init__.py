@@ -90,6 +90,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self.authenticated = False
         self.devices = {}
         self._listen_task = None
+        self._auth_refresh_task = None
         self._auth_event = None
         self._empty_device_states = 0  # Count consecutive empty device lists
         self._last_auth_time: datetime | None = None
@@ -98,6 +99,14 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._last_command_time: datetime | None = None
         self._command_delay = 0.5  # 500ms base delay between commands
         self._timeout_count = 0
+
+        # Session health monitoring
+        self._session_start_time: datetime | None = None
+        self._connection_failures = 0
+        self._auth_failures = 0
+        self._message_response_times = []  # Track last 10 response times
+        self._last_successful_command: datetime | None = None
+        self._session_health_score = 100  # 0-100, higher is better
 
         super().__init__(
             hass,
@@ -113,6 +122,84 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except AttributeError:
             # Handle different websocket library versions
             return self.websocket is not None
+
+    def _calculate_session_health_score(self) -> int:
+        """Calculate session health score (0-100, higher is better)."""
+        if not self._session_start_time:
+            return 0
+
+        score = 100
+        session_age = datetime.now() - self._session_start_time
+
+        # Penalize connection failures (each failure -10 points)
+        score -= min(self._connection_failures * 10, 50)
+
+        # Penalize auth failures (each failure -15 points)
+        score -= min(self._auth_failures * 15, 60)
+
+        # Penalize timeout count (each timeout -5 points)
+        score -= min(self._timeout_count * 5, 40)
+
+        # Penalize old sessions (lose 1 point per minute after 30 minutes)
+        if session_age > timedelta(minutes=30):
+            excess_minutes = (session_age - timedelta(minutes=30)).total_seconds() / 60
+            score -= min(excess_minutes, 30)
+
+        # Bonus for recent successful commands
+        if self._last_successful_command:
+            time_since_success = datetime.now() - self._last_successful_command
+            if time_since_success < timedelta(minutes=1):
+                score += 10
+            elif time_since_success < timedelta(minutes=5):
+                score += 5
+
+        # Penalty for slow response times
+        if self._message_response_times:
+            avg_response_time = sum(self._message_response_times) / len(self._message_response_times)
+            if avg_response_time > 2.0:
+                score -= 15
+            elif avg_response_time > 1.0:
+                score -= 5
+
+        return max(0, min(100, int(score)))
+
+    def _get_optimal_refresh_interval(self) -> int:
+        """Get optimal refresh interval in seconds based on session health."""
+        health_score = self._calculate_session_health_score()
+
+        if health_score >= 90:
+            return 120  # Very healthy - refresh every 2 minutes
+        elif health_score >= 70:
+            return 90   # Good health - refresh every 1.5 minutes
+        elif health_score >= 50:
+            return 60   # Moderate health - refresh every minute
+        elif health_score >= 30:
+            return 45   # Poor health - refresh every 45 seconds
+        else:
+            return 30   # Critical health - refresh every 30 seconds
+
+    def _log_session_health(self) -> None:
+        """Log detailed session health information."""
+        if not self._session_start_time:
+            return
+
+        session_age = datetime.now() - self._session_start_time
+        health_score = self._session_health_score
+
+        avg_response_time = 0
+        if self._message_response_times:
+            avg_response_time = sum(self._message_response_times) / len(self._message_response_times)
+
+        time_since_last_success = "never"
+        if self._last_successful_command:
+            time_since_last_success = str(datetime.now() - self._last_successful_command)
+
+        _LOGGER.info("Session Health Report: score=%d/100, age=%s, conn_failures=%d, auth_failures=%d, "
+                    "timeouts=%d, avg_response=%.2fs, last_success=%s",
+                    health_score, session_age, self._connection_failures, self._auth_failures,
+                    self._timeout_count, avg_response_time, time_since_last_success)
+
+        self._last_health_log = datetime.now()
 
     async def _ensure_connected_and_authenticated(self) -> None:
         """Ensure the websocket is connected and authenticated before sending commands."""
@@ -135,8 +222,18 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         ws_connected = self._is_websocket_connected()
         device_count = len(self.devices)
 
-        _LOGGER.debug("Health check: websocket_connected=%s, authenticated=%s, devices_count=%s",
-                     ws_connected, self.authenticated, device_count)
+        # Update session health score
+        self._session_health_score = self._calculate_session_health_score()
+
+        _LOGGER.debug("Health check: websocket_connected=%s, authenticated=%s, devices_count=%s, health_score=%d",
+                     ws_connected, self.authenticated, device_count, self._session_health_score)
+
+        # Log detailed health metrics periodically
+        if hasattr(self, '_last_health_log'):
+            if datetime.now() - self._last_health_log > timedelta(minutes=5):
+                self._log_session_health()
+        else:
+            self._last_health_log = datetime.now()
 
         if not ws_connected:
             _LOGGER.info("WebSocket not connected, attempting to reconnect...")
@@ -202,6 +299,10 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Initialize activity tracking
             self._last_activity = datetime.now()
 
+            # Initialize session health tracking
+            self._session_start_time = datetime.now()
+            self._connection_failures = 0  # Reset on successful connection
+
             # Reset rate limiting variables
             self._last_command_time = None
             self._command_delay = 0.5
@@ -210,6 +311,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Cancel any existing tasks
             if self._listen_task:
                 self._listen_task.cancel()
+            if self._auth_refresh_task:
+                self._auth_refresh_task.cancel()
 
             # Start listening for messages BEFORE authentication
             self._listen_task = asyncio.create_task(self._listen_for_messages())
@@ -220,7 +323,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.info("Connected to TR7 Exalus at %s", self.host)
 
         except (OSError, WebSocketException, asyncio.TimeoutError) as err:
-            _LOGGER.error("Error connecting to TR7 Exalus: %s", err)
+            self._connection_failures += 1
+            _LOGGER.error("Error connecting to TR7 Exalus (failure #%d): %s", self._connection_failures, err)
             raise ConfigEntryNotReady from err
 
     async def _authenticate(self) -> None:
@@ -249,15 +353,22 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("Authentication timeout - no response from TR7 system")
 
             if not self.authenticated:
+                self._auth_failures += 1
                 raise UpdateFailed("Authentication failed - invalid credentials or system error")
 
+            # Reset auth failure count on successful authentication
+            self._auth_failures = 0
             _LOGGER.info("Successfully authenticated with TR7 Exalus")
             self._last_auth_time = datetime.now()
+
+            # Start periodic authentication refresh to maintain session
+            await self._start_auth_refresh_task()
 
             # Perform initial device discovery after successful authentication
             await self._discover_devices()
 
         except Exception as err:
+            self._auth_failures += 1
             _LOGGER.error("Authentication error: %s", err)
             raise UpdateFailed(f"Authentication failed: {err}") from err
 
@@ -317,6 +428,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 self._timeout_count = 0
                 # Reset command delay to base value on success
                 self._command_delay = 0.5
+                # Track successful command for health monitoring
+                self._last_successful_command = datetime.now()
 
             except (ConnectionClosed, WebSocketException) as err:
                 _LOGGER.error("Error sending message: %s", err)
@@ -333,6 +446,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("WebSocket connection closed")
             self.authenticated = False
             self._last_auth_time = None
+            # Cancel auth refresh task when connection closes
+            if self._auth_refresh_task:
+                self._auth_refresh_task.cancel()
             # Speed up recovery by triggering a refresh
             try:
                 await self.async_request_refresh()
@@ -342,6 +458,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error in message listener: %s", err)
             self.authenticated = False
             self._last_auth_time = None
+            # Cancel auth refresh task on errors
+            if self._auth_refresh_task:
+                self._auth_refresh_task.cancel()
             try:
                 await self.async_request_refresh()
             except Exception:
@@ -546,6 +665,51 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Error handling device state change: %s", err)
 
+    async def _start_auth_refresh_task(self) -> None:
+        """Start the periodic authentication refresh task."""
+        if self._auth_refresh_task:
+            self._auth_refresh_task.cancel()
+        self._auth_refresh_task = asyncio.create_task(self._auth_refresh_worker())
+        _LOGGER.info("Started TR7 session refresh task (adaptive interval based on health)")
+
+    async def _auth_refresh_worker(self) -> None:
+        """Periodically refresh authentication to maintain session."""
+        try:
+            while self._is_websocket_connected() and self.authenticated:
+                # Use adaptive refresh interval based on session health
+                refresh_interval = self._get_optimal_refresh_interval()
+                _LOGGER.debug("Next auth refresh in %ds (health score: %d)",
+                             refresh_interval, self._session_health_score)
+                await asyncio.sleep(refresh_interval)
+
+                # Only refresh if still connected and authenticated
+                if self._is_websocket_connected() and self.authenticated:
+                    try:
+                        # Send login message to refresh session (fire and forget)
+                        refresh_message = {
+                            "TransactionId": str(uuid.uuid4()),
+                            "Data": {
+                                "Email": self.email,
+                                "Password": self.password
+                            },
+                            "Resource": RESOURCE_LOGIN,
+                            "Method": METHOD_LOGIN
+                        }
+
+                        # Use direct websocket send to avoid rate limiting on session refresh
+                        message_str = json.dumps(refresh_message)
+                        await self.websocket.send(message_str)
+                        _LOGGER.debug("Sent session refresh authentication")
+
+                    except Exception as err:
+                        _LOGGER.warning("Failed to send session refresh: %s", err)
+                        # If refresh fails, the normal error handling will catch issues
+                        break
+
+        except asyncio.CancelledError:
+            _LOGGER.debug("Auth refresh task cancelled")
+        except Exception as err:
+            _LOGGER.error("Auth refresh worker error: %s", err)
 
     async def set_cover_position(self, device_guid: str, position: int) -> None:
         """Set cover position."""
@@ -671,6 +835,12 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             except asyncio.CancelledError:
                 pass
 
+        if self._auth_refresh_task:
+            self._auth_refresh_task.cancel()
+            try:
+                await self._auth_refresh_task
+            except asyncio.CancelledError:
+                pass
 
         if self.websocket:
             try:
